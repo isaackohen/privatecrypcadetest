@@ -1,0 +1,43 @@
+cashBackRedeem = cron.schedule('0 0 0 * * *',async () => {
+    const d = new Date();
+    const tdy_day = d.getDay();
+    if (tdy_day === 5) {
+        // cron for unused redeem to cashback_share
+        console.log("cashback Redeem starts");
+        const totalData = await dbModel.cashBack.aggregate([ { $match: {expiryStatus:1} },{$group:{_id:null,amount:{$sum:"$redeem"}}}]);
+        if (totalData && totalData[0] && totalData[0].amount) {
+            let shareAmount = Number(totalData[0].amount).toFixed(5);
+            await dbModel.dividendSettings.updateOne({},{$inc:{"cashback_share":  shareAmount}});
+            await dbModel.cashBack.update({expiryStatus: 1},{$set: {expiryStatus: 3}},{ multi: true });
+        }
+
+        //cashback redeem
+        const cashbackData = await dbModel.cashBack.aggregate([
+            { $match: { expiryStatus: 0} },
+            { $lookup: {
+                    from: "Users",
+                    localField: "userId",
+                    foreignField: "user_id",
+                    as: "user_info"
+                },
+            }, {
+                $unwind:"$user_info",
+            }
+        ]);
+        cashbackData.forEach(async (doc) => {
+            //according to user's rank need to multiply by percentage;
+            const cashbackPer = common.rankIdentify(doc.user_info);
+            doc.percentageAmount = cashbackPer;
+            doc.redeem = parseFloat((cashbackPer/100))*parseFloat(doc.cashBackAmount);
+            doc.expiryStatus = 1;
+            doc.update_date = new Date();
+            delete doc.user_info;
+            await dbModel.cashBack.update({_id:doc._id},{$set:doc});
+            console.log(doc,'doc for cashback')
+        });
+        console.log('cashback Redeem Ends')
+    }
+  
+}, {
+    scheduled: false,
+});

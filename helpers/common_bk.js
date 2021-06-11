@@ -1,0 +1,982 @@
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+const fs = require('fs');
+const crypto = require('crypto');
+const { Random, uuid4, integer, nodeCrypto } = require("random-js");
+const sleep = require('await-sleep');
+const multer = require('multer');
+const multerS3 = require('multer-s3');
+const AWS = require('aws-sdk');
+
+const config = require("../config");
+const { dbModel } = require('../model/db');
+const TronWeb = require('tronweb');
+const redis = require('./redis');
+
+AWS.config.update({accessKeyId: config.AWS_OPTIONS.accessKeyId, secretAccessKey: config.AWS_OPTIONS.secretAccessKey, region: config.AWS_OPTIONS.region});
+const s3 = new AWS.S3();
+
+exports.encrypt = (value) => {
+  const cipher = crypto.createCipheriv(config.crypto.algorithm, config.crypto.passPhrase, config.crypto.iv);
+  let encrypted = cipher.update(value, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  return encrypted;
+}
+
+const decrypt = (value) => {
+  const decipher = crypto.createDecipheriv(config.crypto.algorithm, config.crypto.passPhrase, config.crypto.iv)
+  let decrypted = decipher.update(value, 'hex', 'utf8')
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
+exports.decrypt = decrypt;
+
+exports.createPayload = (key) => {
+  let payload = { subject: key }
+  let token = jwt.sign(payload, config.crypto.jwtToken)
+  return token;
+}
+
+exports.allWinnerdata = async () => {
+  let diceData = await dbModel.dice.aggregate([
+    {$match:
+        {"luckgen" : 1, "status":1}
+    },
+    { $sort : { _id: -1 } },
+    { $limit : 10 },
+    {$lookup:{
+        from: "Users",
+        localField: "userId",
+        foreignField: "user_id",
+        as: "user_docs"
+      }
+    },
+    { $unwind:"$user_docs" },
+    { $lookup: { from: 'Games', pipeline: [{ $match: {'referenceName': 'Dice'} }],as: 'Games' }},
+    { $unwind:"$Games" },
+  ]);
+  let slotData = await dbModel.slots.aggregate([
+    {$match:{trntype:"WIN", 'amount': {
+          $nin: [ "0", "0.00" ]
+        } }},
+    {$sort:{_id:-1}},
+    {$limit:10},
+    {$lookup:  { from: "UserWallet", localField: "userid", foreignField: "_id", as: "wallet_docs"}},
+    {$unwind:"$wallet_docs"},
+    {$lookup:  { from: "Users", localField: "wallet_docs.user_id", foreignField: "user_id", as: "user_docs"}},
+    {$unwind:"$user_docs"},
+    { $lookup: { from: 'Games',localField: "gameName", foreignField: "referenceName",as: 'Games' }},
+    {$unwind:"$Games"}
+  ]);
+  let circleData = await dbModel.circle.aggregate([
+    {$match:
+        {"status":1}
+    },
+    { $sort : { _id: -1 } },
+    { $limit : 10 },
+    {$lookup:{
+        from: "Users",
+        localField: "userId",
+        foreignField: "user_id",
+        as: "user_docs"
+      }
+    },
+    { $unwind:"$user_docs" },
+    { $lookup: { from: 'Games', pipeline: [{ $match: {'referenceName': 'Circle'} }],as: 'Games' }},
+    { $unwind:"$Games" },
+  ]);
+  // let diceData = await dice.find({ status: 1,luckgen:1}).limit(10).sort({_id:-1}).lean();
+  // let slotData = await slots.find({$and:[{trntype:"WIN"}, {$or:[{amount: { $ne: "0.00" }},{amount: { $ne: "0" }}]}]}).populate("userid").limit(20).sort({_id:-1}).lean();
+  let concatedata1 = await diceData.concat(slotData);
+  let concatedata = await concatedata1.concat(circleData);
+  let sorteddata = concatedata.sort(function(a, b) {
+    var keyA = new Date(a.createddate),
+      keyB = new Date(b.createddate);
+    // Compare the 2 dates
+    if (keyA > keyB) return -1;
+    if (keyA < keyB) return 1;
+    return 0;
+  });
+  let allData = await sorteddata.slice(0, 7);
+  let search;
+  // for(let i=0;i<allData.length;i++){
+  //     if(allData[i].luckyNumber){
+  //          search="Dice"
+  //     }else{
+  //         let value = allData[i].gameName
+  //         if(allData[i].providerid && allData[i].providerid == '2'){
+  //           let key = value.replace(/_/g , " ");
+  //           search=key.replace(' bng','');
+  //         }else{
+  //           search=value.replace(/ +/g, "");
+  //         }
+  //     }
+  //     let gameQuery = {"$or":[{'reference': { $regex: '.*' + search + '.*',$options: 'i' }},{'description':{ $regex: '.*' + search + '.*',$options: 'i' }}]};
+  //     let gData = await dbModel.games.findOne(gameQuery).lean();
+  //     if(gData && gData.image){
+  //         allData[i].Url = gData.image;
+  //     }
+  // }
+  return allData;
+}
+exports.totalBetAmount = async function(wallets) {
+  const diceBet = await dbModel.dice.aggregate([ { $match: {userId : wallets.user_id} },{$group:{_id: '$currency', total:{$sum:"$betAmount"}}}]);
+  const circleBet = await dbModel.circle.aggregate([ { $match: {userId : wallets.user_id} },{$group:{_id: '$currency', total:{$sum:"$betAmount"}}}]);
+  const shopTransactionsAmount = await dbModel.shopTransactions.aggregate([ { $match: {userId : wallets.user_id} },{$group:{_id: '$currency', total:{$sum:"$price"}}}]);
+  const slotBet = await dbModel.slots.aggregate([ { $match: {userid : wallets._id, trntype: "BET"} },{$group:{_id: '$currency', total:{$sum: { $abs: { $toDouble: "$amount"}}}}}]);
+
+  const reduceCallback = (acc, item) => {
+    const key = item._id || 'TRX';
+    acc[key] = acc[key] || 0;
+    acc[key] += item.total;
+    return acc;
+  };
+
+  const mappedWithDice = diceBet.reduce(reduceCallback, {});
+  const mappedWithCircle = circleBet.reduce(reduceCallback, mappedWithDice);
+  const mappedWithShopTransactions = shopTransactionsAmount.reduce(reduceCallback, mappedWithCircle);
+  return slotBet.reduce(reduceCallback, mappedWithShopTransactions);
+}
+
+exports.Wagerslotdata =async function(type){
+  let array_game=[];
+  let settingData= await dbModel.dividendSettings.findOne().lean();
+  if(settingData.wager_pool_amount && settingData.winner_pool_amount){
+    var today = new Date();
+    var tdy_day = today.getUTCDay();
+    let daysToCal;
+    switch(tdy_day){
+      case 5:
+        daysToCal = 1;
+        break;
+      case 6:
+        daysToCal = 2;
+        break;
+      case 0:
+        daysToCal = 3;
+        break;
+      case 1:
+        daysToCal = 4;
+        break;
+      case 2:
+        daysToCal = 5;
+        break;
+      case 3:
+        daysToCal = 6;
+        break;
+      case 4:
+        daysToCal = 7;
+        break;
+    }
+    if(type === 'cron'){
+      daysToCal = 7;
+    }
+    let games_data = await dbModel.games.find({game:"Table Games"});
+    if(games_data.length>0){
+      games_data.map(function(item){
+        array_game.push(item.referenceName)
+      })
+    }
+    var queryDate = new Date(Date.now() - 24*60*60 * 1000 * daysToCal);
+    var date = queryDate.getDate();
+    queryDate.setDate(date);
+    queryDate.setHours(+'00');
+    queryDate.setMinutes(+'00');
+    queryDate.setSeconds(+'00');
+    let wagerData = await dbModel.slots.aggregate([
+      {$match:{trntype:"BET",'gameName': { $nin: array_game},"createddate":{$gt:new Date(queryDate)}}},
+      {$group:{_id:"$userid",betAmount:{$sum:{$abs:{$toDouble:"$amount"}}}}},
+      {$sort:{betAmount:-1}},
+      {$limit:20},
+      {$lookup:  { from: "UserWallet", localField: "_id", foreignField: "_id", as: "wallet_docs"}},
+      {$unwind:"$wallet_docs"},
+      {$lookup:  { from: "Users", localField: "wallet_docs.user_id", foreignField: "user_id", as: "user_docs"}},
+      {$unwind:"$user_docs"}
+    ]);
+    let winnerData = await dbModel.slots.aggregate([
+      {$match:{trntype:"WIN",'gameName': { $nin: array_game} ,$or:[{"amount":{$ne:"0.00"}},{"amount":{$ne:"0"}}],"createddate":{$gt:new Date(queryDate)}}},
+      {$group:{_id:"$userid",betAmount:{$sum:{$abs:{$toDouble:"$amount"}}}}},
+      {$sort:{betAmount:-1}},
+      {$limit:20},
+      {$lookup:  { from: "UserWallet", localField: "_id", foreignField: "_id", as: "wallet_docs"}},
+      {$unwind:"$wallet_docs"},
+      {$lookup:  { from: "Users", localField: "wallet_docs.user_id", foreignField: "user_id", as: "user_docs"}},
+      {$unwind:"$user_docs"}
+    ]);
+
+    for(let i=0;i<wagerData.length;i++){
+      if(i===0){
+        wagerData[i]['prize'] = 0.5*settingData.wager_pool_amount;
+      }else{
+        wagerData[i]['prize'] = 0.5*wagerData[i-1]['prize'];
+      }
+    }
+    for(let i=0;i<winnerData.length;i++){
+      if(i===0){
+        winnerData[i]['prize'] = 0.5*settingData.winner_pool_amount;
+      }else{
+        winnerData[i]['prize'] = 0.5*winnerData[i-1]['prize'];
+      }
+    }
+    let data ={wagerData,winnerData};
+    return data;
+  }else{
+    let wagerData = [];
+    let winnerData = [];
+    let data ={wagerData,winnerData};
+    return data;
+  }
+
+}
+
+
+var checkedOnce = 0;
+let logsWrite = exports.logsWrite = (key) => {
+  if(checkedOnce===0)
+  {
+    checkedOnce = 1;
+    fs.readFile("./logs/combined1.outerr.log", "utf-8", (err, data) => {
+      if (!err && data !== '') {
+        var logs = data;
+      }
+      else {
+        var logs = '';
+      }
+      if (typeof key != 'object' && typeof key !== 'array') {
+        logs = logs + ' ' + key+'\n';
+      }
+      else
+      {
+        logs = logs + ' , ' + JSON.stringify(key)+'\n';
+      }
+      fs.writeFile("./logs/combined1.outerr.log", logs, (err) => {
+        checkedOnce = 0;
+      });
+    });
+  }
+  else
+  {
+    setTimeout(function(){logsWrite(key)},3000);
+  }
+}
+
+const whitelist = ['https://crypstagcade.crypcade.io','https://crypadsqcryp.crypcade.io','https://checkcrypcade.crypcade.io','https://crypcade.io','https://crypadsqcryp.crypcade.io','http://localhost:4500','http://localhost:4600','http://localhost:4200','http://192.168.2.180:4600','http://192.168.2.180:4500','http://192.168.4.151:4500','http://192.168.4.75:4200','https://crypstagcade.crypcade.io','https://crypadmincads.crypcade.io','http://192.168.4.7:4500','http://192.168.4.7:4600','http://127.0.0.1:8880'];
+
+exports.whitelistMiddleware = (req, res, next) => {
+  const origin = req.headers['origin'];
+  if (!whitelist.includes(origin)) return res.json({ status: false, code:401, msg: 'unauthorized' });
+  next();
+}
+
+exports.tokenMiddleware = (req, res, next) => {
+  try {
+    const origin = req.headers['origin'];
+    const token = req.headers.authorization.split(' ')[1];
+
+    if (!req.headers.authorization || !token || !whitelist.includes(origin)) return res.json({ status: false, code:401, msg: 'unauthorized' });
+
+    const payload = jwt.verify(token, config.crypto.jwtToken);
+    if (!payload) return res.status(401).send('unauthorized');
+
+    req.genuserId = payload.subject;
+    next();
+  } catch (error) {
+    console.log(`JWT error: ${req.headers}`, error);
+    return res.status(401).send('unauthorized');
+  }
+}
+
+exports.bgTokenMiddleware = (req, res, next) => {
+  const token = req.headers.authorization.split(' ')[1];
+  if (!token) return res.json({ status: false, code:401, msg: 'unauthorized' });
+
+  const payload = jwt.verify(token, config.crypto.jwtToken);
+  if (!payload) return res.status(401).send('unauthorized');
+
+  req.genuserId = payload.subject;
+  next();
+}
+
+exports.update_profit = async function(walletAddress)  {
+  let userData = await dbModel.tokenMining.find();
+  var tokenMiningData = await dbModel.tokenMining.findOne({userId:walletAddress});
+  let settings = await dbModel.dividendSettings.findOne().lean();
+  var total_tokn = 0;
+  var day_amt = 0;
+  var month_amt = 0;
+  var day_amt_eth = 0;
+  var month_amt_eth = 0;
+  if(settings.fake_pool_amount>0 || settings.eth_fake_pool_amount>0 || settings.matic_fake_pool_amount>0){
+    if(userData){
+      for(let i=0; i<userData.length; i++){
+        if(userData[i].Cad_token[3].type === 'unfreeze' && userData[i].Cad_token[3].amount){
+          var total_tokn = parseFloat(total_tokn)+userData[i].Cad_token[3].amount;
+        }
+      }
+      if(settings.user_percent>0 && tokenMiningData){
+        if(tokenMiningData.Cad_token[3].type === 'unfreeze' && tokenMiningData.Cad_token[3].amount){
+          var amt = parseFloat(tokenMiningData.Cad_token[3].amount)/parseFloat(total_tokn);
+          if(settings.fake_pool_amount>0)
+          {
+            var day_amt = parseFloat(amt) * parseFloat(settings.user_percent/100)*parseFloat(settings.fake_pool_amount);
+            var month_amt = parseFloat(day_amt)*30;
+          }
+
+          if(settings.eth_fake_pool_amount>0)
+          {
+            var day_amt_eth = parseFloat(amt) * parseFloat(settings.user_percent/100)*parseFloat(settings.eth_fake_pool_amount);
+            var month_amt_eth = parseFloat(day_amt_eth)*30;
+          }
+
+          if(settings.matic_fake_pool_amount>0)
+          {
+            var day_amt_matic = parseFloat(amt) * parseFloat(settings.user_percent/100)*parseFloat(settings.matic_fake_pool_amount);
+            var month_amt_matic = parseFloat(day_amt_matic)*30;
+          }
+
+          return {status:true,data:{"day_data_trx":day_amt,"month_data_trx":month_amt,"day_data_eth":day_amt_eth,"month_data_eth":month_amt_eth,"day_data_matic":day_amt_matic,"month_data_matic":month_amt_matic}};
+        }else{
+          return {status:true,data:{"day_data_trx":0,"month_data_trx":0,"day_data_eth":0, "month_data_eth":0, "day_data_matic":0, "month_data_matic":0}};
+        }
+      }else{
+        return {status:true,data:{"day_data_trx":0,"month_data_trx":0,"day_data_eth":0, "month_data_eth":0, "day_data_matic":0,"month_data_matic":0}};
+      }
+    }else{
+      return {status:true,data:{"day_data_trx":0,"month_data_trx":0,"day_data_eth":0, "month_data_eth":0, "day_data_matic":0,"month_data_matic":0}};
+    }
+  }else{
+    return {status:true,data:{"day_data_trx":0,"month_data_trx":0,"day_data_eth":0, "month_data_eth":0, "day_data_matic":0,"month_data_matic":0}};
+  }
+}
+
+exports.update_token = async function(req){
+  let tronLink = await tronWebLink();
+  var siteDetails = await dbModel.siteSettings.findOne({}).lean();
+  let instance = await tronLink.contract().at(siteDetails.contractAddress);
+  var tkn_detail = await dbModel.tokenMining.findOne({userId:req.genuserId}).lean();
+  if(tkn_detail){
+    var mined_token = await instance.balances(req.genuserId).call();
+    var freezed_token = await instance.freezeOf(req.genuserId).call();
+    var mined = Number(mined_token._hex) / 1000000000000000000;
+    var freezed = Number(freezed_token._hex) / 1000000000000000000;
+    var update_mine = parseInt(mined);
+    var update_freeze = parseInt(freezed);
+    var updateMine = await dbModel.tokenMining.updateOne({userId:req.genuserId, "Cad_token.type": "mined"},{$set:{"Cad_token.$.amount":update_mine}});
+    var updateFreeze = await dbModel.tokenMining.updateOne({userId:req.genuserId, "Cad_token.type": "unfreeze"},{$set:{"Cad_token.$.amount":update_freeze}});
+    if(updateMine || updateFreeze){
+      let tokenMiningData = await dbModel.tokenMining.findOne({userId:req.genuserId});
+      io.emit('gettknusr',{'tokenData':tokenMiningData,'address':req.genuserId});
+      return { status : true};
+    }else{
+      return { status : true};
+    }
+
+  }else{
+    return { status : false};
+  }
+
+}
+
+// todo - to delete this function
+exports.SetredisConfig = function (key, type, callback) {
+  var types = [];
+  if (type !== '') {
+    var types = type.split(",");
+  }
+  if (typeof types[0] === undefined || typeof types[0] == 'undefined') {
+    types[0] = '';
+  }
+  if (typeof types[1] === undefined || typeof types[1] == 'undefined') {
+    types[1] = '';
+  }
+  if (types.length === 2) {
+    var column = types[0];
+    var value = types[1];
+    let redisModel = mongoose.model(key);
+    var getFrom = [];
+    redisModel.find().exec((userErr, userRes) => {
+      if (userRes) {
+        for (i = 0; i < userRes.length; i++) {
+          if (column !== "") {
+            if(isNaN(userRes[i][column]))
+            {
+              var keys = userRes[i][column];
+            }
+            else
+            {
+              var keys = i;
+            }
+          }
+          else {
+            var keys = i;
+          }
+          getFrom[keys] = userRes[i];
+        }
+        var response = JSON.stringify(getFrom);
+        client.set(key, response);
+        if (value !== '' && isNa(Nvalue)) {
+          callback(getFrom[value]);
+        }
+        else {
+          callback(res(getFrom,column,value));
+        }
+      }
+      else {
+        callback(false);
+      }
+    });
+  }
+  else {
+    callback(false);
+  }
+}
+
+// todo - to delete this function
+const res = exports.sendRes = function (datas,column,value) {
+  if(column!==''&&value!=='')
+  {
+    var push = [];
+    var inC = 0;
+    for (i = 0; i < datas.length; i++) {
+      if(datas[i][column] === value)
+      {
+        push[inC] = datas[i];
+        inC++;
+      }
+    }
+  }
+  else
+  {
+    var push = datas;
+  }
+  return push;
+}
+
+
+// exports.insertActivity = (userId, comment, type, role, req) => {
+//     const ua = req.headers['user-agent'];
+//     var browser= '';
+//     if( /firefox/i.test(ua) )
+//       browser = 'firefox';
+//     else if( /chrome/i.test(ua) )
+//       browser = 'chrome';
+//     else if( /safari/i.test(ua) )
+//       browser = 'safari';
+//     else if( /msie/i.test(ua) )
+//       browser = 'msie';
+//     else
+//       browser = 'unknown';
+//
+//     var ipaddr = req.header('x-forwarded-for') || req.connection.remoteAddress;
+//     var ip = ipaddr.replace('::ffff:', '');
+//
+//     let activityDB = mongoose.model('AdminActivity');
+//     let useractivityDB = mongoose.model('Useractivity');
+//         var ip = ip;
+//         var location = '';
+//         var browser = browser;
+//         let activityJson = {
+//             user_id: userId,
+//             ip: ip,
+//             location: location,
+//             browser: browser,
+//             type: type,
+//             comment: comment,
+//
+//
+//         }
+//         if(role === 'admin')
+//         {
+//         activityDB.create(activityJson, function (err, resData) {
+//         });
+//         }
+//         else{
+//           useractivityDB.create(activityJson, function (err, resData) {
+//         });
+//         }
+// }
+
+exports.placeToken_nw = async (data) => {
+  const userExists = await dbModel.betCount.findOne({userId:data.userId,game_type:data.game_type});
+  const settings = await dbModel.dividendSettings.findOne();
+  const trxCount = data.game_type === 1 ? settings.inhouse_cade : settings.slot_cade;
+
+  if (userExists) {
+    const currentBetAmount = userExists.betAmount + parseFloat(data.betAmount);
+    await betCountUpdated_nw(currentBetAmount, trxCount, userExists, 'update');
+  } else {
+    await betCountUpdated_nw(parseFloat(data.betAmount), trxCount, data, 'create');
+  }
+}
+
+exports.placeToken = async (data) => {
+  const userBetCount = await dbModel.betCount.findOne({userId:data.userId,game_type:data.game_type});
+  const settings = await dbModel.dividendSettings.findOne();
+  const trxCount = data.game_type === 1 ? settings.inhouse_cade : settings.slot_cade;
+
+  const multiplierValue = await getUsrActiveMultiplierValue(data.userId, settings.user_multiplier_mining_limit);
+
+  if (userBetCount) {
+    const currentBetAmount = +userBetCount.betAmount + +data.betAmount;
+    // console.log({currentBetAmount, trxCount, 'userExists.betAmount': userBetCount.betAmount, 'data.betAmount': data.betAmount})
+    if (currentBetAmount >= trxCount) {
+      const tokenCount = currentBetAmount / trxCount * multiplierValue;
+      // const tokenCountWithoutMultiplier = parseInt(currentBetAmount / trxCount);
+      // console.log({tokenCountWithoutMultiplier, tokenCount, multiplierValue})
+      await tokenInsertion(userBetCount, tokenCount);
+      await placeTokenReferral(tokenCount,data.game_type, data.userId);
+      if (multiplierValue > 1) await updateUserMultiplierMinedTokens(data.userId, tokenCount, settings.user_multiplier_mining_limit);
+    }
+    await betCountUpdated(currentBetAmount, trxCount, userBetCount, 'update');
+  } else {
+    // console.log({trxCount, 'userExists.betAmount': userBetCount.betAmount, 'data.betAmount': data.betAmount})
+    if (+data.betAmount >= trxCount) {
+      const tokenCount = data.betAmount / trxCount * multiplierValue;
+      // let tokenCountWithoutMultiplier = parseInt(data.betAmount / trxCount * multiplierValue);
+      // console.log({tokenCountWithoutMultiplier, tokenCount, multiplierValue})
+      await tokenInsertion(data, tokenCount);
+      await placeTokenReferral(tokenCount,data.game_type,data.userId);
+      if (multiplierValue > 1) await updateUserMultiplierMinedTokens(data.userId, tokenCount, settings.user_multiplier_mining_limit);
+    }
+    await betCountUpdated(parseFloat(data.betAmount), trxCount, data,'create');
+  }
+}
+
+const updateUserMultiplierMinedTokens = async (userId, tokenCount, miningLimit = 0) => {
+  const user = await dbModel.users.findOneAndUpdate({
+    user_id: userId,
+    'multipliers.active': true,
+  }, {
+    $inc: {
+      'multipliers.$.minedTokens': tokenCount,
+    }
+  });
+
+  if (!user || !Array.isArray(user.multipliers)) return;
+
+  const activeMultiplier = user.multipliers.find(multiplier => multiplier.active);
+  const exceededTheMiningLimit = activeMultiplier && (activeMultiplier.minedTokens + tokenCount) >= miningLimit;
+
+  if (miningLimit && exceededTheMiningLimit) {
+    await user.findOneAndUpdate({
+      user_id: userId,
+      'multipliers.active': true,
+    }, {
+      $set: {
+        'multipliers.$.active': false,
+      }
+    });
+  }
+}
+
+const getUsrActiveMultiplierValue = async (userId, miningLimit = 0) => {
+  const user = await dbModel.users.findOne({
+    user_id: userId,
+    'multipliers.active': true,
+  });
+
+  if (!user || !Array.isArray(user.multipliers)) return 1;
+
+  const activeMultiplier = user.multipliers.find(multiplier => multiplier.active)
+
+  if (!activeMultiplier) return 1;
+
+  const isValidByMinedTokens = !miningLimit || activeMultiplier.minedTokens < miningLimit;
+  const isValidByDate = getIsValidMultiplierByDate(activeMultiplier);
+
+  if (!isValidByMinedTokens || !isValidByDate) return 1;
+
+  return activeMultiplier.value || 1;
+}
+
+const getIsValidMultiplierByDate = (userMultiplier) => {
+  if (!userMultiplier || !userMultiplier.appliedOn) return false;
+
+  const now = new Date();
+  const yesterday = new Date(now.setDate(now.getDate() - 1));
+  const appliedOn = new Date(userMultiplier.appliedOn);
+
+  return appliedOn > yesterday;
+}
+
+const placeTokenReferral = async (tokenCount, gameType, userId) => {
+  const userRef = await dbModel.users.findOne({user_id:userId}).lean();
+  if (!userRef || !userRef.invitedBy) return;
+
+  const userDetails = await dbModel.users.findOne({_id:userRef.invitedBy}).lean();
+  const siteSettings = await dbModel.siteSettings.findOne();
+  const betAmount = (siteSettings.referal_cade / 100) * tokenCount;
+  const userExists = await dbModel.betCount_ref.findOne({userId:userDetails.user_id,game_type:gameType});
+
+  const crtData = {
+    userId: userDetails.user_id,
+    betAmount: betAmount,
+    game_type: gameType,
+  }
+
+  if (userExists) {
+    const tokenCount = userExists.betAmount + betAmount;
+    const tokenData = {
+      userId: userDetails.user_id,
+      ruserId: userId,
+      token_count: tokenCount,
+    }
+    if (tokenCount >= 1) {
+      await tokenInsertion(userExists, tokenCount);
+      await dbModel.gaugeShare.create(tokenData);
+    }
+    await betCountUpdated_ref(tokenCount, tokenCount, crtData, 'update');
+  } else {
+    const tokenCount = betAmount;
+    const tokenData = {
+      userId: userDetails.user_id,
+      ruserId: userId,
+      token_count: tokenCount,
+    }
+    if (tokenCount >= 1) {
+      await tokenInsertion(crtData, tokenCount);
+      await dbModel.gaugeShare.create(tokenData);
+    }
+    await betCountUpdated_ref(betAmount, tokenCount, crtData, 'create');
+  }
+}
+
+const betCountUpdated_ref = async (currentBetAmount, trxCount, data, type) => {
+  data.betAmount = currentBetAmount >= trxCount ? currentBetAmount - trxCount : currentBetAmount;
+  if (type === 'create') {
+    await dbModel.betCount.create(data);
+  } else {
+    await dbModel.betCount.update({userId:data.userId,game_type:data.game_type},{$set:{betAmount:data.betAmount}});
+  }
+}
+
+const betCountUpdated = async (currentBetAmount, trxCount, data, type) => {
+  const token_transfer = currentBetAmount / +trxCount;
+  const balance_total =  +currentBetAmount - token_transfer * trxCount;
+  const betAmount = balance_total.toFixed(2);
+
+  if (type === 'create') {
+    if (currentBetAmount >= trxCount) {
+      await dbModel.betCount.create({userId: data.userId, game_type: data.game_type, betAmount});
+    } else {
+      await dbModel.betCount.create({userId: data.userId, game_type: data.game_type, betAmount: data.betAmount});
+    }
+  } else {
+    if (currentBetAmount >= trxCount) {
+      await dbModel.betCount.update({userId: data.userId, game_type: data.game_type}, {$set: {betAmount: balance_total}});
+    }else{
+      await dbModel.betCount.update({userId: data.userId, game_type: data.game_type}, {$set: {betAmount}});
+    }
+  }
+};
+
+const betCountUpdated_nw = async (currentBetAmount, trxCount, data, type) => {
+  if (type === 'create') {
+    data.betAmount = currentBetAmount
+    await dbModel.betCount.create(data);
+  } else {
+    await dbModel.betCount.update({userId:data.userId},{$set:{betAmount:currentBetAmount}});
+  }
+};
+
+const tokenInsertion = async (userData, tokenCount) => {
+  const userExists = await dbModel.tokenMining.findOne({userId:userData.userId});
+  if (userExists) {
+    await dbModel.tokenMining.update({userId:userExists.userId, "Cad_token.type": "claim"},{$inc:{"Cad_token.$.amount":tokenCount}});
+  } else {
+    const data = {
+      userId:userData.userId,
+      Cad_token:[
+        {
+          type:'claim',
+          amount:tokenCount
+        },{
+          type:'mined',
+          amount:0
+        },{
+          type:'freeze',
+          amount:0
+        },{
+          type:'unfreeze',
+          amount:0
+        }
+      ],
+    };
+    await dbModel.tokenMining.create(data);
+  }
+};
+
+exports.tokenInsertion = tokenInsertion;
+
+exports.rankIdentify = (data) => {
+  const cashBackPercentage = [0, 1, 1, 3, 5, 7, 10, 12, 15, 22, 30];
+  return cashBackPercentage[+data.rank];
+}
+
+exports.calLoseWin = async (type, userId, slotUserId) => {
+  const today = new Date();
+  const tdy_day = today.getDay();
+  let daysToCal;
+  switch(tdy_day) {
+    case 5:
+      daysToCal = 1;
+      break;
+    case 6:
+      daysToCal = 2;
+      break;
+    case 0:
+      daysToCal = 3;
+      break;
+    case 1:
+      daysToCal = 4;
+      break;
+    case 2:
+      daysToCal = 5;
+      break;
+    case 3:
+      daysToCal = 6;
+      break;
+    case 4:
+      daysToCal = 7;
+      break;
+  }
+
+  const utcHr = daysToCal === 1 ? today.getUTCHours() : 24;
+
+  const matchQuerySlot = {userid:slotUserId,createddate:{$gt:new Date(Date.now() - utcHr*60*60 * 1000 * daysToCal)},rank: { $gte: 2 }};
+  const matchQueryDice = {userId:userId,createddate:{$gt:new Date(Date.now() - utcHr*60*60 * 1000 * daysToCal)},rank: { $gte: 2 }};
+  let amountReduction;
+
+  if (type === 'lose') {
+    matchQueryDice.status = 0;
+    amountReduction = {$sum:"$betAmount"};
+  } else {
+    matchQueryDice.status = 1;
+    amountReduction = {$sum:{$subtract: [ "$payout", "$betAmount" ]}};
+  }
+
+  const diceData = await dbModel.dice.aggregate([
+    {$match:matchQueryDice},
+    {$group:{_id:"$userId",betAmount:amountReduction}}
+  ]);
+  const circleData = await dbModel.circle.aggregate([
+    {$match:matchQueryDice},
+    {$group:{_id:"$userId",betAmount:amountReduction}}
+  ]);
+  const slotData = await dbModel.slots.aggregate([
+    {$match:matchQuerySlot},
+    { $addFields: { roundId: {$cond: [{ $eq: [ "$providerid", "2" ]}, "$remotetranid", "$roundid" ]} } },
+    {$group:{_id:"$roundId", maxQuantity:  { $max: {$abs:{$convert:{input:"$amount",to: "double"}} } },items: {
+          $push: {type:"$trntype",amount:"$amount"}
+        }}}
+  ]);
+
+  if (slotData && slotData.length > 0) {
+    slotData[0].winData = 0;
+    slotData[0].loseData = 0;
+    for (let i = 0; i < slotData.length; i++) {
+      slotData[i]['totalWin'] = 0;
+      slotData[i]['totalLose'] = 0;
+      for (let j = 0; j < slotData[i].items.length; j++) {
+        slotData[i][slotData[i].items[j].type] = Math.abs(slotData[i].items[j].amount);
+        if (+slotData[i]['WIN'] !== +slotData[i]['BET']) {
+          if (slotData[i]['WIN'] === slotData[i]['maxQuantity']) {
+            slotData[i]['totalWin'] = slotData[i]['WIN'] - slotData[i]['BET'];
+          } else {
+            if (slotData[i]['BET'] === +slotData[i]['maxQuantity']) {
+              slotData[i]['totalLose'] = slotData[i]['BET'] - (slotData[i]['WIN'] || 0);
+            }
+          }
+        } else {
+          slotData[i]['totalWin'] = 0;
+          slotData[i]['totalLose'] = 0;
+        }
+      }
+    }
+    for (let i = 0; i < slotData.length; i++) {
+      slotData[0].winData = slotData[i].totalWin +  slotData[0].winData;
+      slotData[0].loseData = slotData[i].totalLose + slotData[0].loseData;
+    }
+  }
+
+  let totalData;
+  const diceCalData = (diceData.length === 0) ? 0 : diceData[0].betAmount;
+  const slotCalData = (slotData.length === 0) ? 0 : (type==='lose') ? slotData[0].loseData : slotData[0].winData;
+  const circleCalData = (circleData.length === 0) ? 0 : circleData[0].betAmount;
+  totalData = +diceCalData + +slotCalData + +circleCalData;
+  return totalData;
+}
+
+const tronWebLink = async () => {
+  return new TronWeb({
+    fullNode: config.trx.tronEnv,
+    solidityNode:config.trx.tronEnv,
+    eventServer: config.trx.tronEvent,
+    privateKey: await decrypt(config.trx.tronKey),
+  });
+};
+
+const tronMintLink = async () => {
+  return new TronWeb({
+    fullNode: config.trx.tronEnv,
+    solidityNode:config.trx.tronEnv,
+    eventServer: config.trx.tronEvent,
+    privateKey: await decrypt(config.trx.tronmintKey),
+  });
+};
+
+// round
+const getLuckyNo = (Min_rand, Max_rand) => {
+  const min = Math.ceil(Min_rand);
+  const max = Math.floor(Max_rand);
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// todo - ??!!
+const updateWalCircle = async (user_id, amount) => {
+  const wallet = await dbModel.wallet.findOne({user_id:user_id}).lean();
+  const amountToUpdate = wallet.trx_wallet.amount/1000000;
+}
+
+const generateRandomValues = (maxValue, label) => {
+  const engine = nodeCrypto;
+  const distribution = integer(0, maxValue);
+  const luckyNumber = distribution(engine);
+  const secretKey = uuid4(engine);
+  const hash = crypto.createHmac('sha256', secretKey).update(String(label[luckyNumber])).digest('hex');
+  return { secretKey, luckyNumber, hash };
+};
+
+const preparingNext = () => {
+  const label = [ '50X','5X','2X','3X','2X','3X','2X','3X','2X',
+    '5X','2X','5X','2X','3X','2X','3X','2X','3X',
+    '2X','5X','2X','5X','2X','3X','2X','3X','2X',
+    '3X','2X','3X','2X','3X','2X','5X','2X','5X',
+    '2X','3X','2X','3X','2X','3X','2X','5X','2X',
+    '5X','2X','3X','2X','3X','2X','3X','2X','5X'];
+  const randomValues = generateRandomValues(53, label);
+  return ({data: 'Result', level: label[randomValues.luckyNumber], levelIndex:randomValues.luckyNumber, key: randomValues.secretKey, hash: randomValues.hash});
+}
+
+const createCurrentGameRound = async (nextRound) => {
+  const data = {
+    level: nextRound.level,
+    levelIndex: nextRound.levelIndex,
+    secretKey: nextRound.key,
+    hash: nextRound.hash,
+  }
+  const create = await dbModel.circleRound.create(data);
+  const formedData = {
+    game:'circle',
+    user_id:create.roundId,
+    luckyNumber:nextRound.levelIndex,
+    secretKey:nextRound.key,
+    hash:nextRound.hash
+  }
+  const gameExists = await dbModel.currentGame.findOne({game:'circle'}).lean();
+  if (gameExists) {
+    await dbModel.currentGame.update({game:'circle'},{$set:formedData})
+  } else {
+    await dbModel.currentGame.create(formedData);
+  }
+  return create.roundId;
+}
+
+const updateRoundBal = async (roundId, level, io) => {
+  const circeData = await dbModel.circle.find({roundId:roundId,level:level});
+  const divisett = await dbModel.dividendSettings.findOne().lean();
+  let amountUpdate = 0;
+  let shareData = [];
+  let arrayId = [];
+  if (!circeData || !circeData.length) return;
+
+  const bulkOperatorWallet = await dbModel.wallet.collection.initializeUnorderedBulkOp();
+  for (let i = 0; i < circeData.length; i++) {
+    arrayId.push(circeData[i]._id);
+    bulkOperatorWallet.find({user_id: circeData[i].userId}).update({$inc:{'trx_wallet.amount': circeData[i].payout * 1000000}});
+    const profit_upd = +circeData[i].payout;
+    amountUpdate = amountUpdate + profit_upd;
+    shareData.push({
+      userid: circeData[i].userId,
+      game: 'Circle',
+      betamount: +circeData[i].betAmount,
+      win: 1,
+      real_org: +divisett.pool_amount,
+      fake_org: +divisett.fake_pool_amount,
+      in_amt: 0,
+      out_amt: +circeData[i].payout,
+      real_mod: +divisett.pool_amount - +circeData[i].payout,
+      fake_mod: +divisett.fake_pool_amount - +circeData[i].payout,
+      shared_percentage:0,
+      shared_amount:0
+    });
+  }
+  await dbModel.circle.update({_id:{$in:arrayId}},{$set:{status:1}},{multi:true});
+  const alldata = await common.allWinnerdata();
+  io.emit('allGameData', alldata);
+  if (bulkOperatorWallet && bulkOperatorWallet.length > 0) {
+    await bulkOperatorWallet.execute();
+  }
+  if (shareData.length > 0) {
+    await dbModel.share.insertMany(shareData);
+  }
+  for (let i = 0; i < circeData.length; i++) {
+    const wallet = await dbModel.wallet.findOne({user_id: circeData[i].userId}).lean();
+    const balance = +wallet.trx_wallet.amount / 1000000;
+    await dbModel.circle.update({_id:circeData[i]._id},{$set:{balAfterBet: balance}});
+    io.emit('getBal',{balance, address: circeData[i].userId});
+  }
+  const updated_pool =  +divisett.pool_amount- amountUpdate;
+  const update_fake_pool =  +divisett.fake_pool_amount - amountUpdate;
+  await dbModel.dividendSettings.updateOne({_id:divisett._id},{$set:{pool_amount:updated_pool,fake_pool_amount:update_fake_pool}});
+};
+
+const timerReHit = async (io) => {
+  let myVar;
+  let timeLeft = 20;
+  const preparingData = await preparingNext();
+  const circleData = await createCurrentGameRound(preparingData);
+
+  io.emit('hash', preparingData.hash);
+
+  const triggerCount = async () => {
+    if (timeLeft > 0) {
+      timeLeft = (timeLeft - 0.01).toFixed(2);
+      if (timeLeft === '19.90') io.emit('startAuto', {});
+      io.emit('timer', {countdown: timeLeft, roundId: circleData});
+    } else {
+      clearInterval(myVar);
+      await sleep(1000);
+      io.emit('showResult', preparingData);
+      await sleep(7000);
+      io.emit('preparingNext', {data: 'Preparing Next Round'});
+
+      let lastRoundId = await redis.getLastRoundId();
+
+      if (lastRoundId !== circleData) {
+        await updateRoundBal(circleData, preparingData.level);
+        await redis.setLastRoundId(circleData);
+      }
+
+      await sleep(7000);
+      io.emit('circleRoundList', await dbModel.circleRound.find().sort({_id:-1}).limit(40));
+      await timerReHit(io);
+    }
+  }
+
+  myVar = setInterval(triggerCount ,15);
+};
+
+exports.upload = multer({
+  storage: multerS3({
+    s3: s3,
+    bucket: 'crypcade/images',
+    key: function (req, file, cb) {
+      cb(null, file.originalname.split('.')[0]+new Date().getTime()+'.'+ file.originalname.split('.')[1]);
+    }
+  })
+});
+
+exports.timerReHit = timerReHit;
+exports.tronWebLink = tronWebLink;
+exports.tronMintLink = tronMintLink;
